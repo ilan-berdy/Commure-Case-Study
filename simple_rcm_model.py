@@ -11,7 +11,7 @@ class SimpleRCMModel:
         - $200 average claim value
         - 5% revenue percentage
         - 60% target margin
-        - 90% dollar approval rate
+        - 90% dollar approval rate target (final outcome)
         - 2-5 minutes per process step
         - Account onboarding schedule: 10/30/60 over 3 months
         - SLAs: 5 days for submission, 3 days for denial work
@@ -27,11 +27,16 @@ class SimpleRCMModel:
         self.TARGET_MARGIN = 0.60  # 60%
         
         # Quality requirements
-        self.TARGET_APPROVAL_RATE = 0.90  # 90%
+        self.TARGET_APPROVAL_RATE = 0.90  # 90% final approval rate target
+        self.DENIAL_RATE = 0.10  # 10% denial rate (1 - approval rate)
         
-        # Process time range
-        self.MIN_TIME_PER_STEP = 2  # minutes
-        self.MAX_TIME_PER_STEP = 5  # minutes
+        # Process time range (minutes)
+        self.MIN_TIME_PER_STEP = 2
+        self.MAX_TIME_PER_STEP = 5
+        
+        # SLA requirements (days)
+        self.SUBMISSION_SLA = 5  # days to submit claims
+        self.DENIAL_WORK_SLA = 3  # days to work denials
         
         # Account onboarding schedule
         self.ACCOUNTS_MONTH1 = 10
@@ -41,8 +46,11 @@ class SimpleRCMModel:
         # Labor costs (Monthly salaries in USD)
         self.ANALYST_BASE_SALARY = 500  # Base monthly salary
         self.FULLY_LOADED_MULTIPLIER = 1.5  # Multiplier for benefits and overhead
-        self.ANALYST_SALARY = self.ANALYST_BASE_SALARY * self.FULLY_LOADED_MULTIPLIER  # $750 fully loaded cost
-        self.MANAGER_SALARY = self.ANALYST_SALARY * 1.5  # $1,125 fully loaded cost
+        self.ANALYST_SALARY = self.ANALYST_BASE_SALARY * self.FULLY_LOADED_MULTIPLIER
+        self.MANAGER_SALARY = self.ANALYST_SALARY * 1.5
+        
+        # Staff ratios
+        self.ANALYSTS_PER_MANAGER = 12
         
         # Process steps
         self.PROCESS_STEPS = [
@@ -58,10 +66,24 @@ class SimpleRCMModel:
         self.DAYS_PER_MONTH = 22  # Standard working days
         self.MINUTES_PER_HOUR = 60
         
+        # Analyst allocation between submission and denial work
+        self.SUBMISSION_ALLOCATION = 0.70  # 70% of analysts on submission work
+        self.DENIAL_ALLOCATION = 0.30  # 30% of analysts on denial work
+        
+        # Denial work ramp-up profile (weeks after start)
+        self.DENIAL_RAMP_UP = {
+            1: 0.0,    # Week 1: No denial work (all submissions)
+            2: 0.0,    # Week 2: No denial work
+            3: 0.25,   # Week 3: 25% of denial work
+            4: 0.50,   # Week 4: 50% of denial work
+            5: 0.75,   # Week 5: 75% of denial work
+            6: 1.0     # Week 6+: Full denial work
+        }
+        
         # Calculate derived constants
         self.CLAIMS_PER_PRACTICE = self._calculate_claims_per_practice()
         self.MINUTES_PER_MONTH = self._calculate_minutes_per_month()
-        self.DENIAL_RATE = 1 - self.TARGET_APPROVAL_RATE
+        self.MINUTES_PER_DAY = self._calculate_minutes_per_day()
 
     def _calculate_claims_per_practice(self):
         """Calculate claims per practice based on total claims value and average claim value"""
@@ -71,6 +93,14 @@ class SimpleRCMModel:
     def _calculate_minutes_per_month(self):
         """Calculate available minutes per month based on standard work schedule"""
         return self.HOURS_PER_DAY * self.DAYS_PER_MONTH * self.MINUTES_PER_HOUR
+
+    def _calculate_minutes_per_day(self):
+        """Calculate available minutes per day"""
+        return self.HOURS_PER_DAY * self.MINUTES_PER_HOUR
+
+    def _get_denial_ramp_up_factor(self, week):
+        """Get the denial work ramp-up factor for a given week"""
+        return self.DENIAL_RAMP_UP.get(week, 1.0)  # Default to full capacity after week 6
 
     def calculate_monthly_metrics(self, month):
         """Calculate metrics for a given month (1-3)"""
@@ -89,51 +119,105 @@ class SimpleRCMModel:
         # Calculate monthly claim volume
         monthly_claims = (active_accounts * self.CLAIMS_PER_PRACTICE) / 12
         
-        # Calculate time per claim (range of 10-25 minutes)
-        min_time_per_claim = self.MIN_TIME_PER_STEP * len(self.PROCESS_STEPS)  # 2 min × 5 steps = 10 min
-        max_time_per_claim = self.MAX_TIME_PER_STEP * len(self.PROCESS_STEPS)  # 5 min × 5 steps = 25 min
-        avg_time_per_claim = (min_time_per_claim + max_time_per_claim) / 2  # 17.5 min average
+        # Calculate approved and denied claims based on target approval rate
+        approved_claims = monthly_claims * self.TARGET_APPROVAL_RATE
+        denied_claims = monthly_claims * self.DENIAL_RATE
         
-        # Calculate total time needed using average time
-        total_minutes_needed = monthly_claims * avg_time_per_claim
+        # Calculate average time per claim
+        avg_time_per_step = (self.MIN_TIME_PER_STEP + self.MAX_TIME_PER_STEP) / 2
+        base_time_per_claim = avg_time_per_step * len(self.PROCESS_STEPS)
         
-        # Calculate required analyst headcount
-        analyst_count = np.ceil(total_minutes_needed / self.MINUTES_PER_MONTH)
+        # Calculate daily volumes
+        daily_claims = monthly_claims / self.DAYS_PER_MONTH
+        daily_denied_claims = denied_claims / self.DAYS_PER_MONTH
         
-        # Calculate manager headcount (1 manager per 12 analysts)
-        manager_count = np.ceil(analyst_count / 12)
+        # Calculate total analyst count needed
+        total_minutes_needed = (
+            (monthly_claims * base_time_per_claim) +  # Submission work
+            (denied_claims * base_time_per_claim * 1.5)  # Denial work (50% more time)
+        )
+        total_analyst_count = np.ceil(total_minutes_needed / self.MINUTES_PER_MONTH)
+        
+        # Split analysts between submission and denial work
+        submission_analysts = np.ceil(total_analyst_count * self.SUBMISSION_ALLOCATION)
+        denial_analysts = np.ceil(total_analyst_count * self.DENIAL_ALLOCATION)
+        
+        # Calculate manager count
+        manager_count = np.ceil(total_analyst_count / self.ANALYSTS_PER_MANAGER)
         
         # Calculate monthly labor costs
         labor_cost = (
-            (analyst_count * self.ANALYST_SALARY) +
+            (total_analyst_count * self.ANALYST_SALARY) +
             (manager_count * self.MANAGER_SALARY)
         )
         
-        # Calculate revenue (5% of total claims value for active accounts)
-        total_claims_value = monthly_claims * self.AVG_CLAIM_VALUE
-        monthly_revenue = total_claims_value * self.REVENUE_PERCENTAGE
+        # Calculate revenue
+        monthly_revenue = approved_claims * self.AVG_CLAIM_VALUE * self.REVENUE_PERCENTAGE
         
         # Calculate gross margin
         gross_margin = ((monthly_revenue - labor_cost) / monthly_revenue) * 100 if monthly_revenue > 0 else 0
         
-        # Calculate SLA compliance
-        daily_claims = monthly_claims / self.DAYS_PER_MONTH
-        claims_per_analyst_per_day = self.MINUTES_PER_MONTH / (self.DAYS_PER_MONTH * avg_time_per_claim)
-        sla_compliant = claims_per_analyst_per_day * analyst_count >= daily_claims
+        # Calculate capacity and SLA metrics
+        submission_minutes_per_day = submission_analysts * self.MINUTES_PER_DAY
+        denial_minutes_per_day = denial_analysts * self.MINUTES_PER_DAY
+        
+        # Calculate minutes needed per day for each stream
+        submission_minutes_needed = daily_claims * base_time_per_claim
+        denial_minutes_needed = daily_denied_claims * (base_time_per_claim * 1.5)
+        
+        # Calculate capacity utilization for each stream
+        submission_utilization = (submission_minutes_needed / submission_minutes_per_day) * 100
+        denial_utilization = (denial_minutes_needed / denial_minutes_per_day) * 100
+        
+        # Check SLA compliance
+        submission_sla_met = submission_minutes_needed <= (submission_minutes_per_day * self.SUBMISSION_SLA)
+        denial_sla_met = denial_minutes_needed <= (denial_minutes_per_day * self.DENIAL_WORK_SLA)
+        
+        # Calculate weekly metrics for denial work ramp-up
+        weekly_denial_metrics = {}
+        for week in range(1, 13):  # Calculate for 12 weeks
+            ramp_up_factor = self._get_denial_ramp_up_factor(week)
+            weekly_denial_claims = (denied_claims / 4) * ramp_up_factor  # Divide monthly by 4 for weekly
+            weekly_denial_minutes = weekly_denial_claims * (base_time_per_claim * 1.5)
+            weekly_denial_capacity = denial_minutes_per_day * 5 * ramp_up_factor  # 5 working days per week
+            
+            # Calculate effective submission capacity including denial analysts working on submissions
+            effective_submission_capacity = submission_minutes_per_day + (denial_minutes_per_day * (1 - ramp_up_factor))
+            weekly_submission_claims = (monthly_claims / 4)  # Divide monthly by 4 for weekly
+            weekly_submission_minutes = weekly_submission_claims * base_time_per_claim
+            weekly_submission_utilization = (weekly_submission_minutes / effective_submission_capacity) * 100
+            
+            weekly_denial_metrics[f'Week_{week}'] = {
+                'Denial_Claims': weekly_denial_claims,
+                'Minutes_Needed': weekly_denial_minutes,
+                'Capacity': weekly_denial_capacity,
+                'Utilization': (weekly_denial_minutes / weekly_denial_capacity) * 100 if weekly_denial_capacity > 0 else 0,
+                'Effective_Submission_Capacity': effective_submission_capacity,
+                'Submission_Utilization': weekly_submission_utilization
+            }
         
         return {
             'Month': month,
             'Active Accounts': active_accounts,
             'Monthly Claims': monthly_claims,
+            'Approved Claims': approved_claims,
+            'Denied Claims': denied_claims,
+            'Approval Rate': self.TARGET_APPROVAL_RATE * 100,
+            'Time per Claim (min)': base_time_per_claim,
             'Daily Claims': daily_claims,
-            'Claims per Analyst per Day': claims_per_analyst_per_day,
-            'Total Time per Claim (min)': avg_time_per_claim,
-            'Analyst Count': analyst_count,
+            'Daily Denied Claims': daily_denied_claims,
+            'Total Analyst Count': total_analyst_count,
+            'Submission Analysts': submission_analysts,
+            'Denial Analysts': denial_analysts,
             'Manager Count': manager_count,
             'Labor Cost': labor_cost,
             'Monthly Revenue': monthly_revenue,
             'Gross Margin %': gross_margin,
-            'SLA Compliance': 'Yes' if sla_compliant else 'No'
+            'Submission SLA Met': submission_sla_met,
+            'Denial SLA Met': denial_sla_met,
+            'Submission Utilization %': submission_utilization,
+            'Denial Utilization %': denial_utilization,
+            'Weekly Denial Metrics': weekly_denial_metrics
         }
 
     def generate_report(self):
